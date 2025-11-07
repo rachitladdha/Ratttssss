@@ -2,339 +2,444 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import altair as alt
+import io
 import matplotlib.pyplot as plt
-
-from io import BytesIO
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.metrics import (
-    confusion_matrix, accuracy_score, precision_score, recall_score,
-    f1_score, roc_auc_score, roc_curve
-)
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+import json
 
-# ---------------------------
-# App Config
-# ---------------------------
-st.set_page_config(page_title="Employee Attrition Intelligence", layout="wide")
-st.title("👔 Employee Attrition Intelligence — Streamlit Dashboard")
-st.caption("Upload your HR dataset (must include an **Attrition** column with values 'Yes'/'No'). "
-           "Explore insights, train models (DT, RF, GBRT, 5-fold stratified CV), and predict on new data.")
+st.set_page_config(layout="wide", page_title="Attrition Dashboard (Streamlit)", initial_sidebar_state="expanded")
 
-# ---------------------------
-# Utilities
-# ---------------------------
-def load_data(file):
-    try:
-        return pd.read_csv(file)
-    except Exception:
-        file.seek(0)
-        return pd.read_csv(file, encoding="latin-1")
+# ---------------------- Helper functions ----------------------
+@st.cache_data(show_spinner=False)
+def detect_label_column(df):
+    # Look for likely label columns
+    candidates = [c for c in df.columns if c.lower() in ("attrition", "left", "resigned", "is_attrition", "is_left")]
+    return candidates[0] if candidates else None
 
-def encode_features(df: pd.DataFrame, target_col: str):
-    y_text = df[target_col].astype(str)
-    X = df.drop(columns=[target_col])
-    X = pd.get_dummies(X, drop_first=False)
-    y_bin = (y_text.str.lower() == "yes").astype(int)
-    return X, y_text, y_bin
+def detect_jobrole_column(df):
+    candidates = [c for c in df.columns if "job" in c.lower() and "role" in c.lower() or c.lower()=="jobrole" or c.lower()=="role"]
+    # fallback common names
+    if not candidates:
+        for name in ["JobRole", "Role", "Position"]:
+            if name in df.columns:
+                candidates.append(name)
+                break
+    return candidates[0] if candidates else None
 
-def align_columns(X_new: pd.DataFrame, feature_list):
-    X_new = pd.get_dummies(X_new, drop_first=False)
-    missing = [c for c in feature_list if c not in X_new.columns]
-    for c in missing:
-        X_new[c] = 0
-    extra = [c for c in X_new.columns if c not in feature_list]
-    X_new = X_new.drop(columns=extra)
-    return X_new[feature_list]
+def detect_satisfaction_column(df):
+    # find a column with 'satisf' substring
+    for c in df.columns:
+        if "satisf" in c.lower():
+            return c
+    # fallback to likely names
+    for name in ["JobSatisfaction", "SatisfactionLevel", "Satisfaction"]:
+        if name in df.columns:
+            return name
+    return None
 
-def model_pack(random_state=42):
-    return {
-        "Decision Tree": DecisionTreeClassifier(random_state=random_state),
-        "Random Forest": RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1),
-        "Gradient Boosted Tree": GradientBoostingClassifier(random_state=random_state),
+def preprocess(df, label_col=None, for_training=True):
+    """
+    - Impute numerical cols with mean.
+    - Impute categorical cols with mode.
+    - Label-encode categorical columns and the label (if present / non-numeric).
+    Returns encoded df, and encoding maps.
+    """
+    df = df.copy()
+    # Detect label if not provided
+    if label_col is None and detect_label_column(df):
+        label_col = detect_label_column(df)
+    # We'll impute and encode on feature columns only (label preserved if present)
+    feature_cols = [c for c in df.columns if c != label_col]
+    num_cols = df[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = df[feature_cols].select_dtypes(include=["object", "category", "bool"]).columns.tolist()
+    # Impute numeric with mean
+    for c in num_cols:
+        df[c] = df[c].astype(float).fillna(df[c].astype(float).mean())
+    # Impute categorical with mode
+    for c in cat_cols:
+        if df[c].isna().any():
+            modes = df[c].mode(dropna=True)
+            fill = modes.iloc[0] if not modes.empty else "Unknown"
+            df[c] = df[c].fillna(fill).astype(str)
+        else:
+            df[c] = df[c].astype(str)
+    # Drop rows with null label (can't train on missing labels)
+    if label_col and df[label_col].isna().any():
+        df = df[~df[label_col].isna()].copy()
+    # Label encode categorical features and label if needed
+    encoding_maps = {}
+    encoders = {}
+    for c in cat_cols:
+        le = LabelEncoder()
+        df[c] = le.fit_transform(df[c])
+        encoding_maps[c] = {str(k): int(v) for v, k in enumerate(le.classes_)}
+        encoders[c] = le
+    if label_col:
+        if not pd.api.types.is_numeric_dtype(df[label_col]):
+            le_y = LabelEncoder()
+            df[label_col] = le_y.fit_transform(df[label_col].astype(str))
+            encoding_maps[label_col] = {str(k): int(v) for v, k in enumerate(le_y.classes_)}
+            encoders[label_col] = le_y
+        else:
+            encoders[label_col] = None
+    return df, encoding_maps, encoders, label_col
+
+def train_models(X_train, y_train):
+    RANDOM_STATE = 42
+    models = {
+        "Decision Tree": DecisionTreeClassifier(random_state=RANDOM_STATE),
+        "Random Forest": RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=RANDOM_STATE),
+        "Gradient Boosting": GradientBoostingClassifier(n_estimators=200, learning_rate=0.05, random_state=RANDOM_STATE)
     }
+    trained = {}
+    for name, m in models.items():
+        m.fit(X_train, y_train)
+        trained[name] = m
+    return trained
 
-def plot_cm(cm, title):
-    fig, ax = plt.subplots(figsize=(4.8, 4.2))
-    im = ax.imshow(cm, cmap="Blues")
-    ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_xticks([0,1]); ax.set_yticks([0,1])
-    ax.set_xticklabels(["No","Yes"]); ax.set_yticklabels(["No","Yes"])
-    ax.set_xlabel("Predicted Attrition"); ax.set_ylabel("Actual Attrition")
-    ax.set_title(title)
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, int(cm[i,j]), ha="center", va="center")
-    fig.tight_layout()
+def compute_metrics(trained_models, X_train, y_train, X_test, y_test):
+    rows = []
+    cms = {}
+    reports = {}
+    for name, model in trained_models.items():
+        y_pred_train = model.predict(X_train)
+        y_pred_test = model.predict(X_test)
+        acc_train = accuracy_score(y_train, y_pred_train)
+        acc_test = accuracy_score(y_test, y_pred_test)
+        rows.append({"Model": name, "Train Accuracy": acc_train, "Test Accuracy": acc_test})
+        cm = confusion_matrix(y_test, y_pred_test, labels=[0,1])
+        cms[name] = cm
+        reports[name] = classification_report(y_test, y_pred_test, output_dict=True, zero_division=0)
+    return pd.DataFrame(rows), cms, reports
+
+def plot_confusion_matrix(cm, class_names):
+    fig, ax = plt.subplots(figsize=(4,3))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_xticklabels(class_names)
+    ax.set_yticklabels(class_names, rotation=0)
     return fig
 
-def make_download(dataframe: pd.DataFrame, filename: str = "predictions.csv"):
-    buff = BytesIO()
-    dataframe.to_csv(buff, index=False)
-    buff.seek(0)
-    st.download_button("⬇️ Download predictions CSV", buff, file_name=filename, mime="text/csv")
+def plot_feature_importances(model, feature_names, top_n=20):
+    if not hasattr(model, "feature_importances_"):
+        return None
+    importances = model.feature_importances_
+    indices = np.argsort(importances)[::-1][:top_n]
+    fig, ax = plt.subplots(figsize=(6, max(3, top_n*0.25)))
+    sns.barplot(x=importances[indices], y=np.array(feature_names)[indices], orient='h', ax=ax)
+    ax.set_title("Feature importances (top {})".format(top_n))
+    return fig
 
-# ---------------------------
-# Data Upload (base)
-# ---------------------------
-with st.sidebar:
-    st.header("1) Base Dataset")
-    base_file = st.file_uploader("Upload HR CSV (with 'Attrition')", type=["csv"], key="base")
-    st.header("2) Settings")
-    test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
-    random_state = st.number_input("Random state", value=42, step=1)
-
-if base_file is None:
-    st.info("Please upload your base HR dataset (e.g., **EA.csv**) from the sidebar.")
-    st.stop()
-
-df = load_data(base_file)
-if "Attrition" not in df.columns:
-    st.error("The uploaded file must contain an 'Attrition' column with values like 'Yes'/'No'.")
-    st.stop()
-
-# Basic type handling
-for col in df.select_dtypes(include="object").columns:
-    df[col] = df[col].astype(str)
-
-# ---------------------------
-# Filters (apply to all charts)
-# ---------------------------
-st.subheader("Filters")
-jobrole_vals = sorted(df["JobRole"].dropna().unique()) if "JobRole" in df.columns else []
-jobrole_sel = st.multiselect("Filter by Job Role", jobrole_vals, default=jobrole_vals if jobrole_vals else None)
-
-sat_col = None
-for c in ["JobSatisfaction", "EnvironmentSatisfaction", "RelationshipSatisfaction"]:
-    if c in df.columns:
-        sat_col = c
-        break
-if sat_col:
-    min_sat, max_sat = int(df[sat_col].min()), int(df[sat_col].max())
-    sat_thr = st.slider(f"Minimum {sat_col}", min_sat, max_sat, min_sat, 1)
+# ---------------------- Sidebar: Data load ----------------------
+st.sidebar.title("Data & Settings")
+uploaded = st.sidebar.file_uploader("Upload dataset (CSV). If none, use the example upload.", type=["csv"])
+use_example = False
+if uploaded is None:
+    st.sidebar.info("No dataset uploaded. You can run with a sample dataset by uploading your EA.csv in the app or use your own.")
 else:
-    sat_thr = None
-    st.warning("No satisfaction column (Job/Environment/Relationship) found — satisfaction filter disabled.")
+    try:
+        df = pd.read_csv(uploaded)
+        st.sidebar.success("Uploaded dataset: {}".format(uploaded.name))
+    except Exception as e:
+        st.sidebar.error(f"Could not read uploaded file: {e}")
+        df = None
 
-def apply_filters(data):
-    d = data.copy()
-    if jobrole_sel and "JobRole" in d.columns:
-        d = d[d["JobRole"].isin(jobrole_sel)]
-    if sat_thr is not None and sat_col in d.columns:
-        d = d[d[sat_col] >= sat_thr]
-    return d
+# If there is a file named 'EA.csv' in the working dir (e.g., if you add it to the repo), prefer it
+import os
+if os.path.exists("EA.csv") and uploaded is None:
+    try:
+        df = pd.read_csv("EA.csv")
+        st.sidebar.success("Loaded EA.csv from repo root.")
+    except Exception:
+        pass
 
-df_f = apply_filters(df)
+if 'df' not in locals() or df is None:
+    df = pd.DataFrame()  # empty placeholder
 
-# ===========================
-# TABS
-# ===========================
-tab_dash, tab_model, tab_predict = st.tabs(["📊 Dashboard", "🤖 Modeling (DT/RF/GBRT)", "🔮 Predict on New Data"])
+# ---------------------- Main layout ----------------------
+st.title("Employee Attrition Dashboard")
+st.markdown("Interactive Streamlit dashboard for exploring attrition and running ML models. Filters apply across charts.")
 
-# ===========================
-# 📊 Dashboard
-# ===========================
-with tab_dash:
-    st.markdown("### Five Insightful Charts for HR Action")
-    # Precompute helpful columns
-    df_f["AttritionFlag"] = (df_f["Attrition"].str.lower() == "yes").astype(int)
+# Tabs: Dashboard, Modeling, Predict
+tabs = st.tabs(["Dashboard", "Modeling & Train", "Predict New Data", "About & Instructions"])
 
-    # 1) Attrition rate by Job Role (Bar)
-    if "JobRole" in df_f.columns:
-        role_rate = df_f.groupby("JobRole")["AttritionFlag"].mean().reset_index()
-        c1 = alt.Chart(role_rate).mark_bar().encode(
-            x=alt.X("AttritionFlag:Q", title="Attrition Rate"),
-            y=alt.Y("JobRole:N", sort="-x", title="Job Role"),
-            tooltip=["JobRole","AttritionFlag"]
-        ).properties(height=350, title="Attrition Rate by Job Role")
-        st.altair_chart(c1, use_container_width=True)
+# ---------------------- DASHBOARD TAB ----------------------
+with tabs[0]:
+    if df.empty:
+        st.warning("No data loaded. Please upload a CSV file using the sidebar or add 'EA.csv' to the repo root.")
     else:
-        st.info("JobRole column not found for Chart 1.")
+        st.subheader("Data snapshot")
+        st.dataframe(df.head())
 
-    # 2) Attrition by OverTime & Gender (Stacked 100% bar)
-    if set(["OverTime","Gender"]).issubset(df_f.columns):
-        grp = df_f.groupby(["OverTime","Gender"])["AttritionFlag"].mean().reset_index()
-        c2 = alt.Chart(grp).mark_bar().encode(
-            x=alt.X("OverTime:N", title="OverTime"),
-            y=alt.Y("AttritionFlag:Q", title="Attrition Rate"),
-            color=alt.Color("Gender:N"),
-            tooltip=["OverTime","Gender","AttritionFlag"]
-        ).properties(height=320, title="Attrition Rate by OverTime & Gender")
-        st.altair_chart(c2, use_container_width=True)
-    else:
-        st.info("OverTime/Gender columns not found for Chart 2.")
+        # Detect key columns
+        label_col = detect_label_column(df) or st.sidebar.text_input("Specify label column name (if not detected)", value="Attrition")
+        job_col = detect_jobrole_column(df) or st.sidebar.text_input("Specify job role column name (if not detected)", value="JobRole")
+        satis_col = detect_satisfaction_column(df) or st.sidebar.text_input("Specify satisfaction column name (if not detected)", value="JobSatisfaction")
 
-    # 3) Tenure curve — Attrition vs YearsAtCompany (Line)
-    if "YearsAtCompany" in df_f.columns:
-        yrs = df_f.groupby("YearsAtCompany")["AttritionFlag"].mean().reset_index()
-        c3 = alt.Chart(yrs).mark_line(point=True).encode(
-            x=alt.X("YearsAtCompany:Q", title="Years At Company"),
-            y=alt.Y("AttritionFlag:Q", title="Attrition Rate"),
-            tooltip=["YearsAtCompany","AttritionFlag"]
-        ).properties(height=320, title="Attrition Rate vs Tenure")
-        st.altair_chart(c3, use_container_width=True)
-    else:
-        st.info("YearsAtCompany not found for Chart 3.")
-
-    # 4) Heatmap — Avg Monthly Income by JobLevel & Attrition
-    if set(["MonthlyIncome","JobLevel","Attrition"]).issubset(df_f.columns):
-        heat = df_f.groupby(["JobLevel","Attrition"])["MonthlyIncome"].mean().reset_index()
-        c4 = alt.Chart(heat).mark_rect().encode(
-            x=alt.X("JobLevel:O", title="Job Level"),
-            y=alt.Y("Attrition:N", title="Attrition"),
-            color=alt.Color("MonthlyIncome:Q", title="Avg Monthly Income"),
-            tooltip=["JobLevel","Attrition","MonthlyIncome"]
-        ).properties(height=300, title="Avg Monthly Income by Job Level & Attrition")
-        st.altair_chart(c4, use_container_width=True)
-    else:
-        st.info("MonthlyIncome/JobLevel/Attrition not found for Chart 4.")
-
-    # 5) Distribution — Distance from Home by Attrition (Boxplot)
-    if set(["DistanceFromHome","Attrition"]).issubset(df_f.columns):
-        box = alt.Chart(df_f).mark_boxplot().encode(
-            x=alt.X("Attrition:N"),
-            y=alt.Y("DistanceFromHome:Q"),
-            color=alt.Color("Attrition:N"),
-            tooltip=["Attrition","DistanceFromHome"]
-        ).properties(height=320, title="Distance From Home distribution by Attrition")
-        st.altair_chart(box, use_container_width=True)
-    else:
-        st.info("DistanceFromHome/Attrition not found for Chart 5.")
-
-# ===========================
-# 🤖 Modeling
-# ===========================
-with tab_model:
-    st.markdown("### Train & Evaluate Models (DT / RF / GBRT)")
-    X, y_text, y_bin = encode_features(df, "Attrition")
-
-    run = st.button("Run 5-fold Stratified CV & Evaluate", key="run_models")
-    if run:
-        X_train, X_test, y_train_text, y_test_text, y_train_bin, y_test_bin = train_test_split(
-            X, y_text, y_bin, test_size=test_size, random_state=random_state, stratify=y_bin
-        )
-
-        models = model_pack(random_state=random_state)
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
-        metrics_rows = []
-        cms = {}
-        rocs = {}
-        roc_colors = {"Decision Tree":"tab:blue","Random Forest":"tab:orange","Gradient Boosted Tree":"tab:green"}
-
-        fig_roc, ax_roc = plt.subplots(figsize=(6.6,6))
-        ax_roc.plot([0,1],[0,1],"--",color="gray",label="Chance")
-
-        for name, model in models.items():
-            cv_acc = cross_val_score(model, X, y_bin, cv=cv, scoring="accuracy").mean()
-            model.fit(X_train, y_train_text)
-
-            ypred_tr = model.predict(X_train); ypred_te = model.predict(X_test)
-            if hasattr(model, "predict_proba"):
-                proba_te = model.predict_proba(X_test)[:,1]
-            else:
-                proba_te = model.decision_function(X_test)
-
-            # Metrics
-            acc_tr = accuracy_score(y_train_text, ypred_tr)
-            acc_te = accuracy_score(y_test_text, ypred_te)
-            prec = precision_score(y_test_text, ypred_te, pos_label="Yes")
-            rec = recall_score(y_test_text, ypred_te, pos_label="Yes")
-            f1 = f1_score(y_test_text, ypred_te, pos_label="Yes")
-            auc = roc_auc_score(y_test_bin, proba_te)
-
-            metrics_rows.append([name, acc_tr, acc_te, prec, rec, f1, auc, cv_acc])
-
-            # Confusion matrices
-            cm_tr = confusion_matrix(y_train_text, ypred_tr, labels=["No","Yes"])
-            cm_te = confusion_matrix(y_test_text, ypred_te, labels=["No","Yes"])
-            cms[name] = (cm_tr, cm_te)
-
-            # ROC
-            fpr, tpr, _ = roc_curve(y_test_bin, proba_te)
-            ax_roc.plot(fpr, tpr, label=f"{name} (AUC={auc:.3f})", color=roc_colors[name])
-
-        ax_roc.set_title("ROC Curves (Test Set)"); ax_roc.set_xlabel("False Positive Rate"); ax_roc.set_ylabel("True Positive Rate"); ax_roc.legend(loc="lower right")
-        st.pyplot(fig_roc)
-
-        # Metrics table
-        metrics_df = pd.DataFrame(metrics_rows, columns=["Algorithm","Training Accuracy","Testing Accuracy","Precision (Test, Yes)","Recall (Test, Yes)","F1 Score (Test, Yes)","AUC (Test)","CV (5-fold) Accuracy"]).set_index("Algorithm")
-        st.dataframe(metrics_df.round(4), use_container_width=True)
-
-        # Confusion matrices (train & test)
-        st.markdown("#### Confusion Matrices")
-        for name, (cm_tr, cm_te) in cms.items():
-            c1, c2 = st.columns(2)
-            with c1: st.pyplot(plot_cm(cm_tr, f"{name} — Training"))
-            with c2: st.pyplot(plot_cm(cm_te, f"{name} — Testing"))
-
-        # Feature importances
-        st.markdown("#### Feature Importances")
-        for name, model in models.items():
-            if hasattr(model, "feature_importances_"):
-                fi = pd.DataFrame({"feature": X_train.columns, "importance": model.feature_importances_}).sort_values("importance", ascending=False)
-                top = fi.head(20).iloc[::-1]
-                fig, ax = plt.subplots(figsize=(8,6))
-                ax.barh(top["feature"], top["importance"], color="goldenrod")
-                ax.set_title(f"Top 20 Feature Importances — {name}"); ax.set_xlabel("Importance"); ax.set_ylabel("Feature")
-                st.pyplot(fig)
-                with st.expander(f"Show full table — {name}"):
-                    st.dataframe(fi.reset_index(drop=True))
-            else:
-                st.info(f"{name} does not expose feature_importances_.")
-
-        # Save best model in session for prediction tab (by AUC)
-        best_name = metrics_df["AUC (Test)"].astype(float).idxmax()
-        st.success(f"Recommended model: **{best_name}** (highest Test AUC)")
-        st.session_state["best_model_name"] = best_name
-        st.session_state["feature_cols"] = list(X_train.columns)
-        st.session_state["trained_models"] = {n:m for n,m in models.items()}
-
-# ===========================
-# 🔮 Predict on New Data
-# ===========================
-with tab_predict:
-    st.markdown("### Upload a New Dataset to Predict Attrition")
-    st.caption("If you ran modeling above, the app will reuse the **best model and feature set**. Otherwise it will train a quick Random Forest on the base dataset silently.")
-
-    new_file = st.file_uploader("Upload new CSV (with same HR structure; 'Attrition' optional)", type=["csv"], key="predict")
-    if new_file is not None:
-        new_df = load_data(new_file)
-        st.dataframe(new_df.head())
-
-        # Ensure we have a model & feature columns
-        if "trained_models" not in st.session_state or "feature_cols" not in st.session_state:
-            # quick train on base dataset (RF)
-            X0, y0_text, y0_bin = encode_features(df, "Attrition")
-            rf = RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1)
-            rf.fit(X0, y0_text)
-            st.session_state["trained_models"] = {"Random Forest": rf}
-            st.session_state["best_model_name"] = "Random Forest"
-            st.session_state["feature_cols"] = list(pd.get_dummies(df.drop(columns=["Attrition"]), drop_first=False).columns)
-
-        best_name = st.session_state["best_model_name"]
-        model = st.session_state["trained_models"][best_name]
-        feature_list = st.session_state["feature_cols"]
-
-        # Prepare new data
-        X_new = new_df.drop(columns=[c for c in ["Attrition"] if c in new_df.columns])
-        X_new_aligned = align_columns(X_new, feature_list)
-
-        # Predict
-        preds = model.predict(X_new_aligned)
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(X_new_aligned)[:,1]
+        st.sidebar.markdown("### Dashboard Filters")
+        # Job role multiselect
+        job_options = ["(all)"]
+        if job_col in df.columns:
+            job_options = ["(all)"] + sorted(df[job_col].dropna().astype(str).unique().tolist())
+        selected_jobs = st.sidebar.multiselect("Job role filter (multi-select)", job_options, default=["(all)"])
+        # satisfaction slider (if column exists and numeric)
+        satis_min, satis_max = 0.0, 1.0
+        satis_default = None
+        if satis_col in df.columns and pd.api.types.is_numeric_dtype(df[satis_col]):
+            satis_min = float(df[satis_col].min())
+            satis_max = float(df[satis_col].max())
+            satis_default = (satis_min, satis_max)
+            selected_satis = st.sidebar.slider("Satisfaction range", min_value=float(satis_min), max_value=float(satis_max), value=satis_default)
         else:
-            # scale decision_function to [0,1] roughly for display if needed
-            df_raw = model.decision_function(X_new_aligned)
-            proba = (df_raw - df_raw.min())/(df_raw.max()-df_raw.min()+1e-9)
+            selected_satis = None
 
-        out = new_df.copy()
-        out["Predicted_Attrition"] = preds
-        out["Predicted_Prob_Yes"] = proba.round(4)
+        # Apply filters to a working df
+        viz_df = df.copy()
+        if "(all)" not in selected_jobs and selected_jobs:
+            viz_df = viz_df[viz_df[job_col].astype(str).isin(selected_jobs)]
+        if selected_satis is not None:
+            viz_df = viz_df[(viz_df[satis_col] >= selected_satis[0]) & (viz_df[satis_col] <= selected_satis[1])]
 
-        st.success(f"Predictions generated with **{best_name}**.")
-        st.dataframe(out.head(50), use_container_width=True)
-        make_download(out, filename="attrition_predictions.csv")
+        st.markdown("### Charts (filters applied)")
+        # Chart 1: Attrition rate by Job Role (bar chart with percentage)
+        st.markdown("#### 1) Attrition rate by Job Role")
+        if job_col in viz_df.columns and label_col in viz_df.columns:
+            grp = viz_df.groupby(job_col).agg(total=(label_col, "size"), attrited=(label_col, lambda x: (x.astype(str).str.lower()=="yes").sum() if x.dtype==object else (x==1).sum()))
+            grp["attrition_rate"] = grp["attrited"] / grp["total"]
+            grp_sorted = grp.sort_values("attrition_rate", ascending=False).reset_index()
+            fig1, ax1 = plt.subplots(figsize=(8,4))
+            sns.barplot(data=grp_sorted, x="attrition_rate", y=job_col, orient="h", ax=ax1)
+            ax1.set_xlabel("Attrition rate (proportion)")
+            st.pyplot(fig1)
+        else:
+            st.info("Job role or label column not detected for Chart 1. Use the sidebar to set names.")
+
+        # Chart 2: Satisfaction vs Attrition (stacked counts)
+        st.markdown("#### 2) Satisfaction vs Attrition (counts by satisfaction level)")
+        if satis_col in viz_df.columns and label_col in viz_df.columns:
+            # Create pivot
+            df_piv = viz_df.copy()
+            # normalize label to 'Yes'/'No' if possible
+            df_piv["_label_str"] = df_piv[label_col].astype(str)
+            piv = pd.crosstab(df_piv[satis_col], df_piv["_label_str"])
+            fig2, ax2 = plt.subplots(figsize=(8,4))
+            piv.plot(kind="bar", stacked=True, ax=ax2)
+            ax2.set_xlabel(satis_col)
+            ax2.set_ylabel("Counts")
+            st.pyplot(fig2)
+        else:
+            st.info("Satisfaction or label column not detected for Chart 2.")
+
+        # Chart 3: Attrition rate by Years at Company (line)
+        st.markdown("#### 3) Attrition rate by Years at Company")
+        years_col = None
+        for c in ["YearsAtCompany", "Years At Company", "Years_in_Company", "YearsWithCompany"]:
+            if c in viz_df.columns:
+                years_col = c; break
+        if years_col is None:
+            # try to find anything with 'year' and 'company'
+            for c in viz_df.columns:
+                if "year" in c.lower() and "company" in c.lower():
+                    years_col = c; break
+        if years_col in viz_df.columns and label_col in viz_df.columns:
+            grp2 = viz_df.groupby(years_col).agg(total=(label_col,"size"), attrited=(label_col, lambda x: (x.astype(str).str.lower()=="yes").sum() if x.dtype==object else (x==1).sum()))
+            grp2["attrition_rate"] = grp2["attrited"] / grp2["total"]
+            grp2 = grp2.reset_index().sort_values(years_col)
+            fig3, ax3 = plt.subplots(figsize=(8,3))
+            ax3.plot(grp2[years_col], grp2["attrition_rate"], marker='o')
+            ax3.set_xlabel(years_col); ax3.set_ylabel("Attrition rate")
+            st.pyplot(fig3)
+        else:
+            st.info("Years at company or label column not detected for Chart 3.")
+
+        # Chart 4: Monthly Income distribution by Attrition (boxplot)
+        st.markdown("#### 4) Monthly Income distribution by Attrition (boxplot)")
+        income_candidates = [c for c in viz_df.columns if "income" in c.lower() or "salary" in c.lower() or "monthly" in c.lower()]
+        income_col = income_candidates[0] if income_candidates else None
+        if income_col and label_col in viz_df.columns:
+            fig4, ax4 = plt.subplots(figsize=(8,4))
+            sns.boxplot(x=viz_df[label_col].astype(str), y=viz_df[income_col], ax=ax4)
+            ax4.set_xlabel("Attrition"); ax4.set_ylabel(income_col)
+            st.pyplot(fig4)
+        else:
+            st.info("Income column or label not detected for Chart 4.")
+
+        # Chart 5: Feature importance (Quick RandomForest on filtered data)
+        st.markdown("#### 5) Quick feature importances (RandomForest trained on filtered data)")
+        # Preprocess and train a RF quickly
+        try:
+            df_enc, encoding_maps, encoders, label_col_enc = preprocess(viz_df, label_col=label_col)
+            X = df_enc.drop(columns=[label_col_enc])
+            y = df_enc[label_col_enc].astype(int)
+            if len(y.unique()) > 1 and len(X.columns)>0:
+                # small train/test split
+                Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, stratify=y, random_state=42)
+                rf = RandomForestClassifier(n_estimators=150, n_jobs=-1, random_state=42)
+                rf.fit(Xtr, ytr)
+                fig5 = plot_feature_importances(rf, X.columns.tolist(), top_n=min(20, X.shape[1]))
+                if fig5:
+                    st.pyplot(fig5)
+                else:
+                    st.info("Model does not expose feature importances.")
+            else:
+                st.info("Not enough data or features for feature importance chart.")
+        except Exception as e:
+            st.error(f"Error creating feature importance: {e}")
+
+# ---------------------- MODELING & TRAIN TAB ----------------------
+with tabs[1]:
+    st.header("Train & Evaluate Models")
+    st.markdown("This tab runs Decision Tree, Random Forest and Gradient Boosting on the (filtered) dataset. Click 'Train Models' to run.")
+    if df.empty:
+        st.warning("No dataset loaded. Upload CSV in the sidebar or add 'EA.csv' to repo root.")
     else:
-        st.info("Upload a new CSV above to generate predictions.")
+        st.markdown("### Choose columns to include as features")
+        # default: all except detected label
+        label_col = detect_label_column(df) or st.text_input("Label column", value="Attrition")
+        all_features = [c for c in df.columns if c != label_col]
+        selected_features = st.multiselect("Select feature columns", all_features, default=all_features)
+        if not selected_features:
+            st.warning("Select at least one feature.")
+        else:
+            run = st.button("Train Models")
+            if run:
+                with st.spinner("Preprocessing and training..."):
+                    df_enc, encoding_maps, encoders, label_col_enc = preprocess(df[[*selected_features, label_col]], label_col=label_col)
+                    X = df_enc.drop(columns=[label_col_enc])
+                    y = df_enc[label_col_enc].astype(int)
+                    # Train/test split
+                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, stratify=y, random_state=42)
+                    trained = train_models(X_train, y_train)
+                    # Save to session_state so Predict tab can use
+                    st.session_state['trained_models'] = trained
+                    st.session_state['encoders'] = encoders
+                    st.session_state['encoding_maps'] = encoding_maps
+                    st.session_state['label_col'] = label_col_enc
+                    st.session_state['feature_names'] = X.columns.tolist()
+                    # Metrics
+                    metrics_df, cms, reports = compute_metrics(trained, X_train, y_train, X_test, y_test)
+                    st.success("Training complete.")
+                    st.markdown("### Accuracy table")
+                    st.dataframe(metrics_df.style.format({"Train Accuracy":"{:.3f}", "Test Accuracy":"{:.3f}"}))
+                    # Confusion matrices
+                    st.markdown("### Confusion Matrices (Test set)")
+                    class_names = None
+                    if label_col_enc in encoding_maps:
+                        inv = {v:k for k,v in encoding_maps[label_col_enc].items()}
+                        class_names = [inv.get(0, "0"), inv.get(1, "1")]
+                    else:
+                        class_names = ["0","1"]
+                    for name, cm in cms.items():
+                        st.markdown(f"**{name}**")
+                        st.pyplot(plot_confusion_matrix(cm, class_names))
+                    # Feature importances for each model
+                    st.markdown("### Feature importances per model (if available)")
+                    for name, model in trained.items():
+                        st.markdown(f"**{name}**")
+                        fig_imp = plot_feature_importances(model, st.session_state['feature_names'], top_n=min(20, len(st.session_state['feature_names'])))
+                        if fig_imp:
+                            st.pyplot(fig_imp)
+                        else:
+                            st.info(f"{name} has no feature_importances_.")
+                    # Save models and artifacts into session state
+                    st.success("Models saved into session (will persist while the app runs).")
+            else:
+                st.info("Click 'Train Models' to preprocess and train the three algorithms on the dataset.")
+
+# ---------------------- PREDICT TAB ----------------------
+with tabs[2]:
+    st.header("Upload new data and predict Attrition")
+    st.markdown("Upload a new CSV (same format as training data without the label or with label). Choose a trained model and predict. You can download the results.")
+    uploaded_new = st.file_uploader("Upload new dataset for prediction (CSV)", type=["csv"], key="predict")
+    model_choice = st.selectbox("Choose model (trained models)", options=["Auto-train and use Random Forest", "Decision Tree", "Random Forest", "Gradient Boosting"])
+    if uploaded_new is not None:
+        try:
+            new_df = pd.read_csv(uploaded_new)
+            st.write("Preview of uploaded data")
+            st.dataframe(new_df.head())
+            # Check session for trained models; if not, auto-train RF on full df
+            if 'trained_models' not in st.session_state:
+                st.warning("No trained models in session. Auto-training a Random Forest on the provided main dataset (if present).")
+                if df.empty:
+                    st.error("Cannot auto-train because no base dataset is loaded. Upload training data in the sidebar or train in Modeling tab.")
+                else:
+                    # train RF on df using all columns except detected label
+                    label_col_main = detect_label_column(df) or st.text_input("Label column (for training)", value="Attrition")
+                    df_enc_main, encoding_maps_main, encoders_main, label_col_enc_main = preprocess(df[[c for c in df.columns if c!=label_col_main] + [label_col_main]], label_col=label_col_main)
+                    X = df_enc_main.drop(columns=[label_col_enc_main])
+                    y = df_enc_main[label_col_enc_main].astype(int)
+                    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+                    rf = RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=42)
+                    rf.fit(Xtr, ytr)
+                    st.session_state['trained_models'] = {"Random Forest": rf}
+                    st.session_state['encoding_maps'] = encoding_maps_main
+                    st.session_state['encoders'] = encoders_main
+                    st.session_state['label_col'] = label_col_enc_main
+                    st.session_state['feature_names'] = X.columns.tolist()
+            # Prepare new data for prediction: impute & encode using training encoders if available
+            # For simplicity apply preprocess() on the new df (this will fit new label encoders on the uploaded file)
+            new_enc, new_maps, new_encoders, new_labelcol = preprocess(new_df, label_col=None, for_training=False)
+            # Choose model
+            chosen_model = None
+            if model_choice == "Auto-train and use Random Forest":
+                chosen_model = st.session_state['trained_models'].get("Random Forest")
+            else:
+                # pick model from session if available, else warn
+                if 'trained_models' in st.session_state and model_choice in st.session_state['trained_models']:
+                    chosen_model = st.session_state['trained_models'][model_choice]
+                else:
+                    st.warning(f"Model {model_choice} not found in session. Using Random Forest if available.")
+                    chosen_model = st.session_state['trained_models'].get("Random Forest")
+            if chosen_model is None:
+                st.error("No model available for prediction. Train models first in Modeling tab or upload a training dataset.")
+            else:
+                # Align features: use session feature names if available
+                feat_names = st.session_state.get('feature_names', new_enc.drop(columns=[new_labelcol]) .columns.tolist())
+                # If columns mismatch try to intersect
+                X_pred = new_enc.copy()
+                if st.session_state.get('feature_names'):
+                    # Add missing columns with zeros, drop extras
+                    for c in st.session_state['feature_names']:
+                        if c not in X_pred.columns:
+                            X_pred[c] = 0
+                    X_pred = X_pred[st.session_state['feature_names']]
+                else:
+                    X_pred = X_pred[feat_names]
+                preds = chosen_model.predict(X_pred)
+                # map label back to original if mapping exists
+                label_map = st.session_state.get('encoding_maps', {}).get(st.session_state.get('label_col', ''), None)
+                if label_map:
+                    inv = {v:k for k,v in label_map.items()}
+                    preds_readable = [inv.get(int(p), str(p)) for p in preds]
+                else:
+                    preds_readable = [str(int(p)) for p in preds]
+                out_df = new_df.copy().reset_index(drop=True)
+                out_df["Predicted_Attrition"] = preds_readable
+                st.markdown("### Predictions preview")
+                st.dataframe(out_df.head())
+                # Download button
+                csv = out_df.to_csv(index=False).encode('utf-8')
+                st.download_button("Download predictions CSV", data=csv, file_name="predictions_with_attrition.csv", mime="text/csv")
+        except Exception as e:
+            st.error(f"Error reading uploaded CSV: {e}")
+    else:
+        st.info("Upload a CSV to run predictions (you can include or exclude the label column).")
+
+# ---------------------- ABOUT & INSTRUCTIONS TAB ----------------------
+with tabs[3]:
+    st.header("About / Instructions")
+    st.markdown("""
+    **How to use this Streamlit app**
+    1. Upload your EA.csv (or any employee dataset) using the sidebar. The app will try to auto-detect the label column 'Attrition', job role column and a satisfaction column.
+    2. Use the Dashboard tab to explore 5 charts with filters (job role multi-select and satisfaction slider).
+    3. Use the Modeling & Train tab to choose features and train Decision Tree, Random Forest and Gradient Boosting classifiers. Click 'Train Models' to run. Models persist in session memory while the app runs.
+    4. Use the Predict tab to upload a new dataset and predict Attrition. You can download the data with predicted labels.
+    \n\n**Notes & engineer choices**\n- Missing numeric values are imputed with column mean; categorical missing values are replaced with the mode.\n- Label encoding is applied per categorical column. The app tries to be robust to common column names but you can override names via the sidebar.\n- For production use, you should: (a) freeze encodings from training and apply identical transforms to new data, (b) add model versioning and persistence, (c) add more metrics such as AUC, precision/recall and class-weighting if classes are imbalanced.
+    """)
+
